@@ -1,0 +1,16 @@
+[package]
+name = "rstrainer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rstrainer"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+numpy = "0.21"
+bytemuck = "1.16"
+image = "0.25"
+rayon = "1.10"
+
