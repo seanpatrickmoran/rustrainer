@@ -3,7 +3,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import cooler
 import hicstraw
@@ -75,6 +75,7 @@ class LiteHiCWriter:
             return nimage, vmax if vmax > 0 else 1.0
 
         mimage = nimage.copy()
+        # keep same general triangular masking idea
         if int(np.round(c_dist * (np.sin(c_angle) - np.cos(c_angle)))) <= n // 10:
             mimage = np.triu(mimage, k=n // 10 + 2)
         else:
@@ -92,15 +93,24 @@ class LiteHiCWriter:
 
         cx = x1 + (x2 - x1) // 2
         cy = y1 + (y2 - y1) // 2
-        r1 = max(0, cx - target // 2)
-        r2 = r1 + target
-        r3 = max(0, cy - target // 2)
-        r4 = r3 + target
+        r1 = cx - target // 2
+        r2 = cx + target // 2
+        r3 = cy - target // 2
+        r4 = cy + target // 2
+
+        if r1 < 0:
+            shift = -r1
+            r1, r2 = 0, r2 + shift
+        if r3 < 0:
+            shift = -r3
+            r3, r4 = 0, r4 + shift
+
         return r1, r2, r3, r4
 
     def _read_feature_lines(self, feature_path: str):
         with open(feature_path, "r") as f:
             first = f.readline()
+            # same heuristic as your working script
             if not (first.startswith("#") or "chr" in first.lower()):
                 f.seek(0)
             for row_num, line in enumerate(f, start=1):
@@ -117,40 +127,65 @@ class LiteHiCWriter:
         norm: str,
     ) -> Iterator[Tuple[bytes, float, float, int]]:
         """
-        Yields tuples: (numpyarr_blob, viewing_vmax, true_max, dimensions)
+        Yields: (numpyarr_blob, viewing_vmax, true_max, dimensions)
         """
+        expected = (dimension + 1, dimension + 1)
+
         if hic_path.endswith(".hic"):
             hic = hicstraw.HiCFile(hic_path)
+
             last_pair = None
             matrix_obj = None
 
-            for _, parts in self._read_feature_lines(feature_path):
+            for row_num, parts in self._read_feature_lines(feature_path):
                 if len(parts) < 6:
                     continue
                 c1, x1, x2, c2, y1, y2 = parts[:6]
-                x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                try:
+                    x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                except Exception:
+                    continue
 
-                c1c, c2c = c1.lstrip("chr"), c2.lstrip("chr")
+                # MATCH YOUR WORKING VERSION:
+                # hicstraw wants chromosome IDs WITHOUT "chr" prefix (e.g., "1", "X")
+                c1c = c1.lstrip("chr")
+                c2c = c2.lstrip("chr")
+
                 pair = (c1c, c2c)
                 if pair != last_pair:
-                    matrix_obj = hic.getMatrixZoomData(
-                        f"chr{c1c}", f"chr{c2c}", "observed", norm, "BP", resolution
-                    )
+                    try:
+                        matrix_obj = hic.getMatrixZoomData(
+                            c1c, c2c, "observed", norm, "BP", resolution
+                        )
+                    except Exception as e:
+                        # skip bad pairs instead of risking native crash later
+                        print(f"[hic] zoomdata fail line {row_num}: {c1c},{c2c} ({e})")
+                        matrix_obj = None
                     last_pair = pair
 
-                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
-                mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
+                if matrix_obj is None:
+                    continue
 
-                # keep your original acceptance logic, but fix the condition
-                if mat.shape not in {(dimension, dimension), (dimension + 1, dimension + 1)}:
+                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
+                if r1 < 0 or r3 < 0:
+                    continue
+
+                # hicstraw can sometimes crash if asked for nonsense ranges; keep it guarded
+                try:
+                    mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
+                except Exception as e:
+                    print(f"[hic] getRecordsAsMatrix fail line {row_num}: {e}")
+                    continue
+
+                # Enforce the exact shape your working script expects
+                if mat.shape != expected:
                     continue
 
                 mat = mat.astype(np.float32, copy=False)
                 _, vmax = self.choose_vmax(self._downsample_view(mat))
-                true_max = float(np.max(mat)) or 1.0
+                true_max = float(np.max(mat)) if float(np.max(mat)) > 0 else 1.0
 
-                # store raw numpy bytes (fast, compact, no metadata beyond shape/dtype)
-                numpy_blob, _, _ = serialize_window_and_hists(mat, vmax, true_max)
+                numpy_blob = mat.tobytes(order="C")
                 yield numpy_blob, float(vmax), float(true_max), int(dimension)
 
         elif hic_path.endswith((".cool", ".mcool")):
@@ -163,39 +198,54 @@ class LiteHiCWriter:
             last_pair = None
             matrix_data = None
 
-            for _, parts in self._read_feature_lines(feature_path):
+            for row_num, parts in self._read_feature_lines(feature_path):
                 if len(parts) < 3:
                     continue
 
-                if len(parts) < 6:
-                    c1, x1, y1 = parts[:3]
-                    x1, y1 = int(x1), int(y1)
-                    x2, y2, c2 = x1 + resolution, y1 + resolution, c1
-                else:
-                    c1, x1, x2, c2, y1, y2 = parts[:6]
-                    x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                try:
+                    if len(parts) < 6:
+                        c1, x1, y1 = parts[:3]
+                        x1, y1 = int(x1), int(y1)
+                        x2, y2, c2 = x1 + resolution, y1 + resolution, c1
+                    else:
+                        c1, x1, x2, c2, y1, y2 = parts[:6]
+                        x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                except Exception:
+                    continue
 
                 if not c1.startswith("chr"):
                     c1, c2 = f"chr{c1}", f"chr{c2}"
 
                 pair = (c1, c2)
                 if pair != last_pair:
-                    matrix_data = clr.matrix(balance=balance).fetch(c1, c2)
+                    try:
+                        matrix_data = clr.matrix(balance=balance).fetch(c1, c2)
+                    except Exception as e:
+                        print(f"[cool] fetch fail line {row_num}: {c1},{c2} ({e})")
+                        matrix_data = None
                     last_pair = pair
+
+                if matrix_data is None:
+                    continue
 
                 r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
                 b = resolution
-                mat = matrix_data[
-                    r1 // b : r1 // b + dimension + 1,
-                    r3 // b : r3 // b + dimension + 1,
-                ]
-                mat = np.nan_to_num(mat, nan=0.0).astype(np.float32, copy=False)
 
-                if mat.shape != (dimension + 1, dimension + 1):
+                try:
+                    mat = matrix_data[
+                        r1 // b : r1 // b + dimension + 1,
+                        r3 // b : r3 // b + dimension + 1,
+                    ]
+                except Exception as e:
+                    print(f"[cool] slice fail line {row_num}: {e}")
+                    continue
+
+                mat = np.nan_to_num(mat, nan=0.0).astype(np.float32, copy=False)
+                if mat.shape != expected:
                     continue
 
                 _, vmax = self.choose_vmax(self._downsample_view(mat))
-                true_max = float(np.max(mat)) or 1.0
+                true_max = float(np.max(mat)) if float(np.max(mat)) > 0 else 1.0
 
                 numpy_blob = mat.tobytes(order="C")
                 yield numpy_blob, float(vmax), float(true_max), int(dimension)
@@ -219,13 +269,17 @@ class LiteHiCWriter:
         conn.commit()
         conn.close()
 
-    def run(self, output_db: str):
+    def run(self, output_db: str, limit: int = 1000, max_records: int = 0):
+        """
+        limit: batch size (commit every `limit` inserts)
+        max_records: optional cap; 0 means no cap
+        """
         self.create_database(output_db)
         conn = sqlite3.connect(output_db)
         cur = conn.cursor()
 
-        BATCH = 1000
         batch: List[Tuple[int, bytes, float, float, int]] = []
+        written = 0
 
         try:
             for ds in self.config.get("datasets", []):
@@ -234,50 +288,97 @@ class LiteHiCWriter:
 
                 for res, dim in dims.items():
                     for numpy_blob, vmax, true_max, dimension in self.process_hic_file(
-                        ds["hic_path"],
-                        ds["feature_path"],
-                        res,
-                        dim,
-                        norm,
+                        ds["hic_path"], ds["feature_path"], res, dim, norm
                     ):
+                        # optional hard cap if you ever want it (leave max_records=0 to disable)
+                        if max_records and written >= max_records:
+                            break
+
                         key_id = self.current_key_id
                         self.current_key_id += 1
 
-                        batch.append((key_id, numpy_blob, vmax, true_max, dimension))
+                        # keep "try and just save" behavior:
+                        try:
+                            batch.append((key_id, numpy_blob, vmax, true_max, dimension))
+                            written += 1
+                        except Exception as e:
+                            print(f"Skipping record key_id={key_id} (prep fail): {e}")
+                            continue
 
-                        if len(batch) >= BATCH:
-                            cur.executemany(
+                        # COMMIT cadence: every `limit` rows
+                        if len(batch) >= limit:
+                            try:
+                                cur.executemany(
+                                    "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
+                                    "VALUES (?,?,?,?,?)",
+                                    batch,
+                                )
+                                conn.commit()
+                                print(f"Wrote batch of {len(batch)} rows (total={written})")
+                                batch.clear()
+                            except Exception as e:
+                                print(f"Batch write failed ({e}); trying individual inserts...")
+                                # fallback: try individually
+                                for row in batch:
+                                    try:
+                                        cur.execute(
+                                            "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
+                                            "VALUES (?,?,?,?,?)",
+                                            row,
+                                        )
+                                    except Exception as e2:
+                                        print(f"  Failed key_id={row[0]}: {e2}")
+                                conn.commit()
+                                batch.clear()
+
+                    if max_records and written >= max_records:
+                        break
+                if max_records and written >= max_records:
+                    break
+
+            # flush remainder
+            if batch:
+                try:
+                    cur.executemany(
+                        "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
+                        "VALUES (?,?,?,?,?)",
+                        batch,
+                    )
+                    conn.commit()
+                    print(f"Wrote final batch of {len(batch)} rows (total={written})")
+                except Exception as e:
+                    print(f"Final batch write failed ({e}); trying individual inserts...")
+                    for row in batch:
+                        try:
+                            cur.execute(
                                 "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
                                 "VALUES (?,?,?,?,?)",
-                                batch,
+                                row,
                             )
-                            conn.commit()
-                            batch.clear()
-
-            if batch:
-                cur.executemany(
-                    "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                    "VALUES (?,?,?,?,?)",
-                    batch,
-                )
-                conn.commit()
+                        except Exception as e2:
+                            print(f"  Failed key_id={row[0]}: {e2}")
+                    conn.commit()
                 batch.clear()
+
         finally:
             conn.close()
 
         print(f"Database saved to: {output_db}")
-        print(f"Total records written: {self.current_key_id - 1}")
+        print(f"Total records written (attempted adds): {written}")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python lite_writer.py <config.json/yaml> [output.db]")
+        print("Usage: python lite_writer.py <config.json/yaml> [output.db] [batch_size]")
         raise SystemExit(1)
 
     config_path = sys.argv[1]
     output_db = sys.argv[2] if len(sys.argv) > 2 else "output.db"
-    LiteHiCWriter(config_path).run(output_db)
+    batch_size = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+
+    LiteHiCWriter(config_path).run(output_db, limit=batch_size, max_records=0)
 
 
 if __name__ == "__main__":
     main()
+
