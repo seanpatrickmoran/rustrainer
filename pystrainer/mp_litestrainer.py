@@ -246,7 +246,6 @@ class LiteHiCWriter:
                 if line:
                     yield row_num, line.split("\t")
 
-
     def process_hic_file(
         self,
         hic_path: str,
@@ -254,100 +253,30 @@ class LiteHiCWriter:
         resolution: int,
         dimension: int,
         norm: str,
-<<<<<<< HEAD
         workers: int = 4,
-        chunksize: int = 200,  # tune: 50-2000 depending on row cost
-    ):
-        expected = (dimension + 1, dimension + 1)
-    
-        if hic_path.endswith(".hic"):
-            ctx = mp.get_context("spawn")  # safest with native libs
-    
-            # generator of tasks: (row_num, parts)
-            def tasks():
-                for row_num, parts in self._read_feature_lines(feature_path):
-                    # optional quick filter here to reduce worker load
-                    if len(parts) >= 6:
-                        yield (row_num, parts)
-    
-            with ctx.Pool(
-                processes=workers,
-                initializer=_worker_init,
-                initargs=(hic_path, norm, resolution, dimension),
-                maxtasksperchild=5000,  # helps with long runs / leaks; tune 1k-20k
-            ) as pool:
-                for out in pool.imap_unordered(_process_one_feature_row, tasks(), chunksize=chunksize):
-                    if out is None:
-                        continue
-                    numpy_blob, vmax, true_max, dim = out
-    
-                    # dim should match dimension, but keep it for safety
-                    yield numpy_blob, float(vmax), true_max, dim
-    
-=======
     ) -> Iterator[Tuple[bytes, float, float, int]]:
         """
         Yields: (numpyarr_blob, viewing_vmax, true_max, dimensions)
         """
-        expected = (dimension + 1, dimension + 1)
 
         if hic_path.endswith(".hic"):
-            hic = hicstraw.HiCFile(hic_path)
+            ctx = mp.get_context("spawn")  # safer than fork for native libs
+            tasks = list(self._read_feature_lines(feature_path))  # (row_num, parts)
 
-            last_pair = None
-            matrix_obj = None
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_worker_init,
+                initargs=(hic_path, norm, resolution, dimension),
+            ) as ex:
+                futures = [ex.submit(_process_one_feature_row, t) for t in tasks]
 
-            for row_num, parts in self._read_feature_lines(feature_path):
-                if len(parts) < 6:
-                    continue
-                c1, x1, x2, c2, y1, y2 = parts[:6]
-                try:
-                    x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
-                except Exception:
-                    continue
-
-                # MATCH YOUR WORKING VERSION:
-                # hicstraw wants chromosome IDs WITHOUT "chr" prefix (e.g., "1", "X")
-                c1c = c1.lstrip("chr")
-                c2c = c2.lstrip("chr")
-
-                pair = (c1c, c2c)
-                if pair != last_pair:
-                    try:
-                        matrix_obj = hic.getMatrixZoomData(
-                            c1c, c2c, "observed", norm, "BP", resolution
-                        )
-                    except Exception as e:
-                        # skip bad pairs instead of risking native crash later
-                        print(f"[hic] zoomdata fail line {row_num}: {c1c},{c2c} ({e})")
-                        matrix_obj = None
-                    last_pair = pair
-
-                if matrix_obj is None:
-                    continue
-
-                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
-                if r1 < 0 or r3 < 0:
-                    continue
-
-                # hicstraw can sometimes crash if asked for nonsense ranges; keep it guarded
-                try:
-                    mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
-                except Exception as e:
-                    print(f"[hic] getRecordsAsMatrix fail line {row_num}: {e}")
-                    continue
-
-                # Enforce the exact shape your working script expects
-                if mat.shape != expected:
-                    continue
-
-                mat = mat.astype(np.float32, copy=False)
-                _, vmax = self.choose_vmax(self._downsample_view(mat))
-                true_max = float(np.max(mat)) if float(np.max(mat)) > 0 else 1.0
-
-                numpy_blob = mat.tobytes(order="C")
-                yield numpy_blob, float(vmax), float(true_max), int(dimension)
->>>>>>> 9a5f681c2937e55203d0ad686e53ce7915ef8e52
+                for fut in as_completed(futures):
+                    out = fut.result()
+                    if out is None:
+                        continue
+                    numpy_blob, vmax, true_max, dim = out
+                    yield numpy_blob, vmax, true_max, dim
 
         elif hic_path.endswith((".cool", ".mcool")):
             clr = cooler.Cooler(
@@ -419,9 +348,8 @@ class LiteHiCWriter:
         cur.execute("PRAGMA journal_mode=WAL;")
         cur.execute("PRAGMA synchronous=OFF;")
         cur.execute("PRAGMA temp_store=MEMORY;")
-        cur.execute("PRAGMA cache_size=-200000;")  # ~200k pages in KB units when negative; adjust
-        cur.execute("PRAGMA mmap_size=30000000000;")  # 30GB if you have it; otherwise lower
-
+        cur.execute("PRAGMA cache_size=-200000;")
+        cur.execute("PRAGMA mmap_size=30000000000;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS imag_with_seqs (
@@ -444,91 +372,18 @@ class LiteHiCWriter:
         self.create_database(output_db)
         conn = sqlite3.connect(output_db)
         cur = conn.cursor()
-<<<<<<< HEAD
-    
-        batch: List[Tuple[int, bytes, float, float, int]] = []
-        written = 0
-    
-        def flush_batch(reason=""):
-            """Safe flush helper used on normal exit or Ctrl+C"""
-            nonlocal batch, written
-            if not batch:
-                return
-            try:
-                cur.executemany(
-                    "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                    "VALUES (?,?,?,?,?)",
-                    batch,
-                )
-                conn.commit()
-                print(f"\n[FLUSH] {len(batch)} rows written {reason} (total={written})")
-            except Exception as e:
-                print(f"\n[FLUSH-ERROR] batch failed ({e}); trying individual inserts...")
-                for row in batch:
-                    try:
-                        cur.execute(
-                            "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                            "VALUES (?,?,?,?,?)",
-                            row,
-                        )
-                    except Exception as e2:
-                        print(f"  Failed key_id={row[0]}: {e2}")
-                conn.commit()
-            batch.clear()
-    
-=======
 
         batch: List[Tuple[int, bytes, float, float, int]] = []
         written = 0
 
->>>>>>> 9a5f681c2937e55203d0ad686e53ce7915ef8e52
         try:
             for ds in self.config.get("datasets", []):
                 dims = self.validate_dimensions(ds.get("resolutions", DEFAULT_RESOLUTIONS))
                 norm = ds.get("options", {}).get("norm", "NONE")
-<<<<<<< HEAD
-    
-                for res, dim in dims.items():
-                    try:
-                        for numpy_blob, vmax, true_max, dimension in self.process_hic_file(
-                            ds["hic_path"], ds["feature_path"], res, dim, norm,
-                        ):
-                            if max_records and written >= max_records:
-                                break
-    
-                            key_id = self.current_key_id
-                            self.current_key_id += 1
-    
-                            batch.append((key_id, numpy_blob, vmax, true_max, dimension))
-                            written += 1
-    
-                            if len(batch) >= limit:
-                                flush_batch()
-    
-                    except KeyboardInterrupt:
-                        # 🔥 THIS is the graceful exit point
-                        print("\n[INTERRUPT] Caught Ctrl+C – flushing pending rows...")
-                        flush_batch("(interrupted)")
-                        raise  # re-raise to outer handler
-    
-                    if max_records and written >= max_records:
-                        break
-    
-                if max_records and written >= max_records:
-                    break
-    
-            # normal completion
-            flush_batch("(final)")
-    
-        except KeyboardInterrupt:
-            # second-level catch so we still close DB cleanly
-            print("\n[STOPPED] User requested stop. Database is consistent.")
-    
-=======
 
                 for res, dim in dims.items():
                     for numpy_blob, vmax, true_max, dimension in self.process_hic_file(
-                        ds["hic_path"], ds["feature_path"], res, dim, norm
+                        ds["hic_path"], ds["feature_path"], res, dim, norm, 
                     ):
                         # optional hard cap if you ever want it (leave max_records=0 to disable)
                         if max_records and written >= max_records:
@@ -598,20 +453,11 @@ class LiteHiCWriter:
                     conn.commit()
                 batch.clear()
 
->>>>>>> 9a5f681c2937e55203d0ad686e53ce7915ef8e52
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    
+            conn.close()
+
         print(f"Database saved to: {output_db}")
-<<<<<<< HEAD
-        print(f"Total records written: {written}")
-    
-=======
         print(f"Total records written (attempted adds): {written}")
->>>>>>> 9a5f681c2937e55203d0ad686e53ce7915ef8e52
 
 
 def main():
@@ -628,4 +474,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
