@@ -16,7 +16,7 @@ from skimage.transform import hough_line, hough_line_peaks
 
 from rstrainer import serialize_window_and_hists
 
-DEFAULT_RESOLUTIONS = [ 5000, 10000]
+DEFAULT_RESOLUTIONS = [5000, 10000]
 DIMENSION_MAP = {2000: 162, 5000: 64, 10000: 32}
 
 
@@ -132,6 +132,7 @@ class UnifiedHiCPipeline:
             last_pair = None
             matrix_obj = None
 
+
             for row_num, parts in self._read_feature_lines(feature_path):
                 if len(parts) < 6:
                     continue
@@ -140,17 +141,20 @@ class UnifiedHiCPipeline:
                 x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
 
                 c1c, c2c = c1.lstrip("chr"), c2.lstrip("chr")
+                #if not c1.startswith("chr"):
+                #    c1c, c2c = f"chr{c1}", f"chr{c2}"
+
                 pair = (c1c, c2c)
                 if pair != last_pair:
                     matrix_obj = hic.getMatrixZoomData(
-                        f"chr{c1c}", f"chr{c2c}", "observed", norm, "BP", resolution
+                        f"{c1c}", f"{c2c}", "observed", norm, "BP", resolution
                     )
                     last_pair = pair
 
                 r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
                 np_mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
 
-                if (np_mat.shape != (dimension + 1, dimension + 1) or np_mat.shape != (dimension , dimension)):
+                if (np_mat.shape != (dimension + 1, dimension + 1) and np_mat.shape != (dimension , dimension)):
                     continue
 
                 np_mat = np_mat.astype(np.float32, copy=False)
@@ -289,7 +293,7 @@ class UnifiedHiCPipeline:
         conn.close()
 
     def run(self, output_db: str):
-        print("Starting unified Hi-C image pipeline.")  # :contentReference[oaicite:2]{index=2}
+        print("Starting unified Hi-C image pipeline.")  # 
         print(f"Config has {len(self.config.get('datasets', []))} datasets")
         for dataset in self.config.get("datasets", []):
             print(f"  Dataset: {dataset.get('name', 'UNKNOWN')}")
@@ -318,7 +322,7 @@ class UnifiedHiCPipeline:
                     batch_maps,
                 )
                 conn.commit()
-                print(f"    Wrote batch of {len(batch_rows)} records")  # :contentReference[oaicite:3]{index=3}
+                print(f"    Wrote batch of {len(batch_rows)} records")  # 
             except Exception as e:
                 print(f"    Error writing batch: {e}")
                 for record in batch_rows:
@@ -345,11 +349,11 @@ class UnifiedHiCPipeline:
 
         try:
             for ds in self.config["datasets"]:
-                print(f"\nProcessing dataset: {ds.get('name', 'UNKNOWN')}")  # :contentReference[oaicite:5]{index=5}
+                print(f"\nProcessing dataset: {ds.get('name', 'UNKNOWN')}")  # 
                 dims = self.validate_dimensions(ds.get("resolutions", DEFAULT_RESOLUTIONS))
 
                 for res, dim in dims.items():
-                    print(f"  Processing resolution: {res}bp")  # :contentReference[oaicite:6]{index=6}
+                    print(f"  Processing resolution: {res}bp")  # 
                     norm = ds.get("options", {}).get("norm", "NONE")
 
                     for key_id, rec in self.process_hic_file(
@@ -405,9 +409,9 @@ class UnifiedHiCPipeline:
                         batch_maps,
                     )
                     conn.commit()
-                    print(f"  Wrote final batch of {len(batch_rows)} records")  # :contentReference[oaicite:7]{index=7}
+                    print(f"  Wrote final batch of {len(batch_rows)} records")
                 except Exception as e:
-                    print(f"  Error writing final batch: {e}")  # :contentReference[oaicite:8]{index=8}
+                    print(f"  Error writing final batch: {e}")  
                     for record in batch_rows:
                         try:
                             cursor.execute(
@@ -430,7 +434,7 @@ class UnifiedHiCPipeline:
         with open(mapping_path, "w") as f:
             json.dump(self.feature_mapping, f, indent=2)
 
-        print("\nPipeline complete!")  # :contentReference[oaicite:9]{index=9}
+        print("\nPipeline complete!")
         print(f"Database saved to: {output_db}")
         print(f"Feature mapping saved to: {mapping_path}")
         print(f"Total images processed: {self.current_key_id - 1}")
