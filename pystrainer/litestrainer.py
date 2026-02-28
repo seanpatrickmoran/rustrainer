@@ -11,9 +11,137 @@ import numpy as np
 import yaml
 from skimage.filters import threshold_otsu
 from skimage.transform import hough_line, hough_line_peaks
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+
+_WORK_HIC = None
+_WORK_MATRIX_CACHE = {}
+_WORK_PARAMS = {}
+
+def _worker_init(hic_path: str, norm: str, resolution: int, dimension: int):
+    global _WORK_HIC, _WORK_MATRIX_CACHE, _WORK_PARAMS
+    _WORK_HIC = hicstraw.HiCFile(hic_path)
+    _WORK_MATRIX_CACHE = {}
+    _WORK_PARAMS = {
+        "hic_path": hic_path,
+        "norm": norm,
+        "resolution": int(resolution),
+        "dimension": int(dimension),
+    }
+
+
 
 DEFAULT_RESOLUTIONS = [5000, 10000]
 DIMENSION_MAP = {2000: 162, 5000: 64, 10000: 32}
+
+def _windowing(x1, x2, y1, y2, res, width):
+    target = res * width
+    if (x2 - x1) >= target and (y2 - y1) >= target:
+        return x1, x2, y1, y2
+    cx = x1 + (x2 - x1) // 2
+    cy = y1 + (y2 - y1) // 2
+    r1 = cx - target // 2
+    r2 = cx + target // 2
+    r3 = cy - target // 2
+    r4 = cy + target // 2
+    if r1 < 0:
+        shift = -r1
+        r1, r2 = 0, r2 + shift
+    if r3 < 0:
+        shift = -r3
+        r3, r4 = 0, r4 + shift
+    return r1, r2, r3, r4
+
+def _downsample_view(mat: np.ndarray, target: int = 64) -> np.ndarray:
+    n = mat.shape[0]
+    if n <= target:
+        return mat
+    step = max(1, n // target)
+    return mat[::step, ::step]
+
+def _choose_vmax(nimage: np.ndarray) -> Tuple[np.ndarray, float]:
+    thresh = threshold_otsu(nimage)
+    binary = nimage > thresh
+    tested_angles = np.linspace(-np.pi / 2, np.pi / 2, 360, endpoint=False)
+    h, theta, d = hough_line(binary, theta=tested_angles)
+
+    c_angle, c_dist = 0.0, 0.0
+    chosen = 10.0
+    for _, angle, dist in zip(*hough_line_peaks(h, theta, d)):
+        slope = np.tan(angle + np.pi / 2)
+        if abs(1 - abs(slope)) < abs(1 - abs(chosen)):
+            c_angle = float(angle)
+            c_dist = float(dist)
+            chosen = float(slope)
+
+    slope = float(np.tan(c_angle + np.pi / 2))
+    n = nimage.shape[0]
+    if slope > 10:
+        vmax = float(np.max(nimage))
+        return nimage, vmax if vmax > 0 else 1.0
+
+    mimage = nimage.copy()
+    if int(np.round(c_dist * (np.sin(c_angle) - np.cos(c_angle)))) <= n // 10:
+        mimage = np.triu(mimage, k=n // 10 + 2)
+    else:
+        mimage = np.triu(mimage, k=-n // 10)
+
+    vmax = float(np.max(mimage))
+    return mimage, vmax if vmax > 0 else 1.0
+
+def _process_one_feature_row(task):
+    """
+    task: (row_num, parts)
+    returns: (numpy_blob, vmax, true_max, dimension) or None
+    """
+    global _WORK_HIC, _WORK_MATRIX_CACHE, _WORK_PARAMS
+    row_num, parts = task
+
+    if len(parts) < 6:
+        return None
+
+    c1, x1, x2, c2, y1, y2 = parts[:6]
+    try:
+        x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+    except Exception:
+        return None
+
+    c1c = c1.lstrip("chr")
+    c2c = c2.lstrip("chr")
+
+    norm = _WORK_PARAMS["norm"]
+    resolution = _WORK_PARAMS["resolution"]
+    dimension = _WORK_PARAMS["dimension"]
+    expected = (dimension + 1, dimension + 1)
+
+    cache_key = (c1c, c2c, resolution, norm)
+    matrix_obj = _WORK_MATRIX_CACHE.get(cache_key)
+    if matrix_obj is None:
+        try:
+            matrix_obj = _WORK_HIC.getMatrixZoomData(
+                c1c, c2c, "observed", norm, "BP", resolution
+            )
+            _WORK_MATRIX_CACHE[cache_key] = matrix_obj
+        except Exception:
+            return None
+
+    r1, r2, r3, r4 = _windowing(x1, x2, y1, y2, resolution, dimension)
+    if r1 < 0 or r3 < 0:
+        return None
+
+    try:
+        mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
+    except Exception:
+        return None
+
+    if mat.shape != expected:
+        return None
+
+    mat = mat.astype(np.float32, copy=False)
+    _, vmax = _choose_vmax(_downsample_view(mat))
+    true_max = float(np.max(mat)) if float(np.max(mat)) > 0 else 1.0
+    numpy_blob = mat.tobytes(order="C")
+    return numpy_blob, float(vmax), float(true_max), int(dimension)
 
 
 class LiteHiCWriter:
@@ -118,6 +246,7 @@ class LiteHiCWriter:
                 if line:
                     yield row_num, line.split("\t")
 
+
     def process_hic_file(
         self,
         hic_path: str,
@@ -125,68 +254,35 @@ class LiteHiCWriter:
         resolution: int,
         dimension: int,
         norm: str,
-    ) -> Iterator[Tuple[bytes, float, float, int]]:
-        """
-        Yields: (numpyarr_blob, viewing_vmax, true_max, dimensions)
-        """
+        workers: int = 4,
+        chunksize: int = 200,  # tune: 50-2000 depending on row cost
+    ):
         expected = (dimension + 1, dimension + 1)
-
+    
         if hic_path.endswith(".hic"):
-            hic = hicstraw.HiCFile(hic_path)
-
-            last_pair = None
-            matrix_obj = None
-
-            for row_num, parts in self._read_feature_lines(feature_path):
-                if len(parts) < 6:
-                    continue
-                c1, x1, x2, c2, y1, y2 = parts[:6]
-                try:
-                    x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
-                except Exception:
-                    continue
-
-                # MATCH YOUR WORKING VERSION:
-                # hicstraw wants chromosome IDs WITHOUT "chr" prefix (e.g., "1", "X")
-                c1c = c1.lstrip("chr")
-                c2c = c2.lstrip("chr")
-
-                pair = (c1c, c2c)
-                if pair != last_pair:
-                    try:
-                        matrix_obj = hic.getMatrixZoomData(
-                            c1c, c2c, "observed", norm, "BP", resolution
-                        )
-                    except Exception as e:
-                        # skip bad pairs instead of risking native crash later
-                        print(f"[hic] zoomdata fail line {row_num}: {c1c},{c2c} ({e})")
-                        matrix_obj = None
-                    last_pair = pair
-
-                if matrix_obj is None:
-                    continue
-
-                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
-                if r1 < 0 or r3 < 0:
-                    continue
-
-                # hicstraw can sometimes crash if asked for nonsense ranges; keep it guarded
-                try:
-                    mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
-                except Exception as e:
-                    print(f"[hic] getRecordsAsMatrix fail line {row_num}: {e}")
-                    continue
-
-                # Enforce the exact shape your working script expects
-                if mat.shape != expected:
-                    continue
-
-                mat = mat.astype(np.float32, copy=False)
-                _, vmax = self.choose_vmax(self._downsample_view(mat))
-                true_max = float(np.max(mat)) if float(np.max(mat)) > 0 else 1.0
-
-                numpy_blob = mat.tobytes(order="C")
-                yield numpy_blob, float(vmax), float(true_max), int(dimension)
+            ctx = mp.get_context("spawn")  # safest with native libs
+    
+            # generator of tasks: (row_num, parts)
+            def tasks():
+                for row_num, parts in self._read_feature_lines(feature_path):
+                    # optional quick filter here to reduce worker load
+                    if len(parts) >= 6:
+                        yield (row_num, parts)
+    
+            with ctx.Pool(
+                processes=workers,
+                initializer=_worker_init,
+                initargs=(hic_path, norm, resolution, dimension),
+                maxtasksperchild=5000,  # helps with long runs / leaks; tune 1k-20k
+            ) as pool:
+                for out in pool.imap_unordered(_process_one_feature_row, tasks(), chunksize=chunksize):
+                    if out is None:
+                        continue
+                    numpy_blob, vmax, true_max, dim = out
+    
+                    # dim should match dimension, but keep it for safety
+                    yield numpy_blob, float(vmax), true_max, dim
+    
 
         elif hic_path.endswith((".cool", ".mcool")):
             clr = cooler.Cooler(
@@ -255,6 +351,12 @@ class LiteHiCWriter:
     def create_database(self, output_path: str):
         conn = sqlite3.connect(output_path)
         cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=OFF;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("PRAGMA cache_size=-200000;")  # ~200k pages in KB units when negative; adjust
+        cur.execute("PRAGMA mmap_size=30000000000;")  # 30GB if you have it; otherwise lower
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS imag_with_seqs (
@@ -277,94 +379,87 @@ class LiteHiCWriter:
         self.create_database(output_db)
         conn = sqlite3.connect(output_db)
         cur = conn.cursor()
-
+    
         batch: List[Tuple[int, bytes, float, float, int]] = []
         written = 0
-
+    
+        def flush_batch(reason=""):
+            """Safe flush helper used on normal exit or Ctrl+C"""
+            nonlocal batch, written
+            if not batch:
+                return
+            try:
+                cur.executemany(
+                    "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
+                    "VALUES (?,?,?,?,?)",
+                    batch,
+                )
+                conn.commit()
+                print(f"\n[FLUSH] {len(batch)} rows written {reason} (total={written})")
+            except Exception as e:
+                print(f"\n[FLUSH-ERROR] batch failed ({e}); trying individual inserts...")
+                for row in batch:
+                    try:
+                        cur.execute(
+                            "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
+                            "VALUES (?,?,?,?,?)",
+                            row,
+                        )
+                    except Exception as e2:
+                        print(f"  Failed key_id={row[0]}: {e2}")
+                conn.commit()
+            batch.clear()
+    
         try:
             for ds in self.config.get("datasets", []):
                 dims = self.validate_dimensions(ds.get("resolutions", DEFAULT_RESOLUTIONS))
                 norm = ds.get("options", {}).get("norm", "NONE")
-
+    
                 for res, dim in dims.items():
-                    for numpy_blob, vmax, true_max, dimension in self.process_hic_file(
-                        ds["hic_path"], ds["feature_path"], res, dim, norm
-                    ):
-                        # optional hard cap if you ever want it (leave max_records=0 to disable)
-                        if max_records and written >= max_records:
-                            break
-
-                        key_id = self.current_key_id
-                        self.current_key_id += 1
-
-                        # keep "try and just save" behavior:
-                        try:
+                    try:
+                        for numpy_blob, vmax, true_max, dimension in self.process_hic_file(
+                            ds["hic_path"], ds["feature_path"], res, dim, norm,
+                        ):
+                            if max_records and written >= max_records:
+                                break
+    
+                            key_id = self.current_key_id
+                            self.current_key_id += 1
+    
                             batch.append((key_id, numpy_blob, vmax, true_max, dimension))
                             written += 1
-                        except Exception as e:
-                            print(f"Skipping record key_id={key_id} (prep fail): {e}")
-                            continue
-
-                        # COMMIT cadence: every `limit` rows
-                        if len(batch) >= limit:
-                            try:
-                                cur.executemany(
-                                    "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                                    "VALUES (?,?,?,?,?)",
-                                    batch,
-                                )
-                                conn.commit()
-                                print(f"Wrote batch of {len(batch)} rows (total={written})")
-                                batch.clear()
-                            except Exception as e:
-                                print(f"Batch write failed ({e}); trying individual inserts...")
-                                # fallback: try individually
-                                for row in batch:
-                                    try:
-                                        cur.execute(
-                                            "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                                            "VALUES (?,?,?,?,?)",
-                                            row,
-                                        )
-                                    except Exception as e2:
-                                        print(f"  Failed key_id={row[0]}: {e2}")
-                                conn.commit()
-                                batch.clear()
-
+    
+                            if len(batch) >= limit:
+                                flush_batch()
+    
+                    except KeyboardInterrupt:
+                        # 🔥 THIS is the graceful exit point
+                        print("\n[INTERRUPT] Caught Ctrl+C – flushing pending rows...")
+                        flush_batch("(interrupted)")
+                        raise  # re-raise to outer handler
+    
                     if max_records and written >= max_records:
                         break
+    
                 if max_records and written >= max_records:
                     break
-
-            # flush remainder
-            if batch:
-                try:
-                    cur.executemany(
-                        "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                        "VALUES (?,?,?,?,?)",
-                        batch,
-                    )
-                    conn.commit()
-                    print(f"Wrote final batch of {len(batch)} rows (total={written})")
-                except Exception as e:
-                    print(f"Final batch write failed ({e}); trying individual inserts...")
-                    for row in batch:
-                        try:
-                            cur.execute(
-                                "INSERT INTO imag_with_seqs (key_id, numpyarr, viewing_vmax, true_max, dimensions) "
-                                "VALUES (?,?,?,?,?)",
-                                row,
-                            )
-                        except Exception as e2:
-                            print(f"  Failed key_id={row[0]}: {e2}")
-                    conn.commit()
-                batch.clear()
-
+    
+            # normal completion
+            flush_batch("(final)")
+    
+        except KeyboardInterrupt:
+            # second-level catch so we still close DB cleanly
+            print("\n[STOPPED] User requested stop. Database is consistent.")
+    
         finally:
-            conn.close()
-
+            try:
+                conn.close()
+            except Exception:
+                pass
+    
         print(f"Database saved to: {output_db}")
-        print(f"Total records written (attempted adds): {written}")
+        print(f"Total records written: {written}")
+    
 
 
 def main():
