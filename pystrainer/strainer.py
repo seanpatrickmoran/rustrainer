@@ -4,7 +4,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import cooler
 import hicstraw
@@ -20,6 +20,30 @@ DEFAULT_RESOLUTIONS = [5000, 10000]
 DIMENSION_MAP = {2000: 162, 5000: 64, 10000: 32}
 
 
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}", file=sys.stderr)
+
+
+def normalize_to_hic_chrom(name: str, chrom_names: set) -> Optional[str]:
+    """
+    Normalize an input chrom name (e.g. 'chr1' or '1') to match the .hic chromosome
+    naming exactly, using the set of names present in the .hic file.
+
+    Returns None if the chromosome can't be mapped.
+    """
+    if name in chrom_names:
+        return name
+    if name.startswith("chr"):
+        alt = name[3:]
+        if alt in chrom_names:
+            return alt
+    else:
+        alt = "chr" + name
+        if alt in chrom_names:
+            return alt
+    return None
+
+
 class UnifiedHiCPipeline:
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
@@ -27,7 +51,6 @@ class UnifiedHiCPipeline:
         self.current_key_id = 1
         self.feature_mapping: Dict[int, str] = {}
         self._twobit_cache: Dict[str, Any] = {}
-
 
     def load_config(self) -> dict:
         if not self.config_path.exists():
@@ -58,25 +81,24 @@ class UnifiedHiCPipeline:
         step = max(1, n // target)
         return mat[::step, ::step]
 
-
     def choose_vmax(self, nimage: np.ndarray) -> Tuple[np.ndarray, float]:
         thresh = threshold_otsu(nimage)
         binary = nimage > thresh
         tested_angles = np.linspace(-np.pi / 2, np.pi / 2, 360, endpoint=False)
         h, theta, d = hough_line(binary, theta=tested_angles)
 
-        c_angle, c_dist = 0, 0
-        chosen = 10
+        c_angle, c_dist = 0.0, 0.0
+        chosen = 10.0
 
         for _, angle, dist in zip(*hough_line_peaks(h, theta, d)):
-            slope = np.tan(angle + np.pi / 2)
+            slope = float(np.tan(angle + np.pi / 2))
             if abs(1 - abs(slope)) < abs(1 - abs(chosen)):
-                c_angle = angle
-                c_dist = dist
+                c_angle = float(angle)
+                c_dist = float(dist)
                 chosen = slope
 
-        slope = np.tan(c_angle + np.pi / 2)
-        n = nimage.shape[0]
+        slope = float(np.tan(c_angle + np.pi / 2))
+        n = int(nimage.shape[0])
 
         if slope > 10:
             vmax = float(np.max(nimage))
@@ -90,7 +112,6 @@ class UnifiedHiCPipeline:
 
         vmax = float(np.max(mimage))
         return mimage, vmax if vmax > 0 else 1.0
-
 
     def windowing(
         self, x1: int, x2: int, y1: int, y2: int, res: int, width: int
@@ -106,7 +127,6 @@ class UnifiedHiCPipeline:
         r3 = max(0, cy - target // 2)
         r4 = r3 + target
         return r1, r2, r3, r4
-
 
     def _read_feature_lines(self, feature_path: str):
         with open(feature_path, "r") as f:
@@ -129,39 +149,69 @@ class UnifiedHiCPipeline:
 
         if hic_path.endswith(".hic"):
             hic = hicstraw.HiCFile(hic_path)
-            last_pair = None
-            matrix_obj = None
 
+            chroms = hic.getChromosomes()
+            chrom_len: Dict[str, int] = {c.name: int(c.length) for c in chroms}
+            chrom_names = set(chrom_len.keys())
+
+            last_pair: Optional[Tuple[str, str]] = None
+            matrix_obj = None
 
             for row_num, parts in self._read_feature_lines(feature_path):
                 if len(parts) < 6:
                     continue
 
                 c1, x1, x2, c2, y1, y2 = parts[:6]
-                x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                try:
+                    x1, x2, y1, y2 = map(int, (x1, x2, y1, y2))
+                except Exception:
+                    warn(f"{feature_path}:{row_num} has non-integer coords, skipped.")
+                    continue
 
-                c1c, c2c = c1.lstrip("chr"), c2.lstrip("chr")
-                #if not c1.startswith("chr"):
-                #    c1c, c2c = f"chr{c1}", f"chr{c2}"
+                c1h = normalize_to_hic_chrom(c1, chrom_names)
+                c2h = normalize_to_hic_chrom(c2, chrom_names)
+                if c1h is None or c2h is None:
+                    warn(
+                        f"{feature_path}:{row_num} chroms not in .hic ({c1},{c2}); skipped."
+                    )
+                    continue
 
-                pair = (c1c, c2c)
+                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
+
+                L1 = chrom_len.get(c1h, 0)
+                L2 = chrom_len.get(c2h, 0)
+
+                if r1 < 0 or r3 < 0 or r2 > L1 or r4 > L2:
+                    warn(f"{c1h}:{r1}-{r2}, {c2h}:{r3}-{r4} OOB, skipped.")
+                    continue
+
+                if r2 <= r1 or r4 <= r3:
+                    warn(f"{c1h}:{r1}-{r2}, {c2h}:{r3}-{r4} invalid window, skipped.")
+                    continue
+
+                pair = (c1h, c2h)
                 if pair != last_pair:
                     matrix_obj = hic.getMatrixZoomData(
-                        f"{c1c}", f"{c2c}", "observed", norm, "BP", resolution
+                        c1h, c2h, "observed", norm, "BP", resolution
                     )
                     last_pair = pair
 
-                r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
+                if matrix_obj is None:
+                    warn(f"{c1h},{c2h} matrix zoom data unavailable, skipped.")
+                    continue
+
                 np_mat = matrix_obj.getRecordsAsMatrix(r1, r2, r3, r4)
 
-                if (np_mat.shape != (dimension + 1, dimension + 1) and np_mat.shape != (dimension , dimension)):
+                if np_mat.shape not in ((dimension + 1, dimension + 1), (dimension, dimension)):
                     continue
 
                 np_mat = np_mat.astype(np.float32, copy=False)
                 _, vmax = self.choose_vmax(self._downsample_view(np_mat))
                 true_max = float(np.max(np_mat)) or 1.0
 
-                numpy_bytes, hrel, htrue = serialize_window_and_hists(np_mat, vmax, true_max)
+                numpy_bytes, hrel, htrue = serialize_window_and_hists(
+                    np_mat, vmax, true_max
+                )
 
                 key_id = self.current_key_id
                 self.current_key_id += 1
@@ -169,7 +219,7 @@ class UnifiedHiCPipeline:
                 self.feature_mapping[key_id] = feature_key
 
                 yield key_id, {
-                    "coordinates": [c1, x1, x2, c2, y1, y2],
+                    "coordinates": [c1h, x1, x2, c2h, y1, y2],
                     "numpy_bytes": numpy_bytes,
                     "viewing_vmax": vmax,
                     "true_max": true_max,
@@ -186,7 +236,7 @@ class UnifiedHiCPipeline:
             )
             balance = norm in ("KR", "VC", "VC_SQRT")
             last_pair = None
-            matrix_data = None
+            mat_selector = clr.matrix(balance=balance, sparse=False)
 
             for row_num, parts in self._read_feature_lines(feature_path):
                 if len(parts) < 3:
@@ -205,15 +255,12 @@ class UnifiedHiCPipeline:
 
                 pair = (c1, c2)
                 if pair != last_pair:
-                    matrix_data = clr.matrix(balance=balance).fetch(c1, c2)
                     last_pair = pair
 
                 r1, r2, r3, r4 = self.windowing(x1, x2, y1, y2, resolution, dimension)
-                b = resolution
-                mat = matrix_data[
-                    r1 // b : r1 // b + dimension + 1,
-                    r3 // b : r3 // b + dimension + 1,
-                ]
+                region1 = f"{c1}:{r1}-{r2}"
+                region2 = f"{c2}:{r3}-{r4}"
+                mat = mat_selector.fetch(region1, region2)
                 mat = np.nan_to_num(mat, nan=0.0).astype(np.float32, copy=False)
 
                 if mat.shape != (dimension + 1, dimension + 1):
@@ -222,7 +269,9 @@ class UnifiedHiCPipeline:
                 _, vmax = self.choose_vmax(self._downsample_view(mat))
                 true_max = float(np.max(mat)) or 1.0
 
-                numpy_bytes, hrel, htrue = serialize_window_and_hists(mat, vmax, true_max)
+                numpy_bytes, hrel, htrue = serialize_window_and_hists(
+                    mat, vmax, true_max
+                )
 
                 key_id = self.current_key_id
                 self.current_key_id += 1
@@ -293,7 +342,7 @@ class UnifiedHiCPipeline:
         conn.close()
 
     def run(self, output_db: str):
-        print("Starting unified Hi-C image pipeline.")  # 
+        print("Starting unified Hi-C image pipeline.")
         print(f"Config has {len(self.config.get('datasets', []))} datasets")
         for dataset in self.config.get("datasets", []):
             print(f"  Dataset: {dataset.get('name', 'UNKNOWN')}")
@@ -322,9 +371,9 @@ class UnifiedHiCPipeline:
                     batch_maps,
                 )
                 conn.commit()
-                print(f"    Wrote batch of {len(batch_rows)} records")  # 
+                print(f"    Wrote batch of {len(batch_rows)} records")
             except Exception as e:
-                print(f"    Error writing batch: {e}")
+                print(f"    Error writing batch: {e}", file=sys.stderr)
                 for record in batch_rows:
                     try:
                         cursor.execute(
@@ -332,14 +381,10 @@ class UnifiedHiCPipeline:
                             record,
                         )
                     except Exception as e2:
-                        print(f"      Failed to write record {record[0]}: {e2}")
-                # Feature mappings are best-effort in fallback path too
+                        print(f"      Failed to write record {record[0]}: {e2}", file=sys.stderr)
                 for fmap in batch_maps:
                     try:
-                        cursor.execute(
-                            "INSERT INTO feature_mapping VALUES (?,?,?)",
-                            fmap,
-                        )
+                        cursor.execute("INSERT INTO feature_mapping VALUES (?,?,?)", fmap)
                     except Exception:
                         pass
                 conn.commit()
@@ -349,11 +394,11 @@ class UnifiedHiCPipeline:
 
         try:
             for ds in self.config["datasets"]:
-                print(f"\nProcessing dataset: {ds.get('name', 'UNKNOWN')}")  # 
+                print(f"\nProcessing dataset: {ds.get('name', 'UNKNOWN')}")
                 dims = self.validate_dimensions(ds.get("resolutions", DEFAULT_RESOLUTIONS))
 
                 for res, dim in dims.items():
-                    print(f"  Processing resolution: {res}bp")  # 
+                    print(f"  Processing resolution: {res}bp")
                     norm = ds.get("options", {}).get("norm", "NONE")
 
                     for key_id, rec in self.process_hic_file(
@@ -411,7 +456,7 @@ class UnifiedHiCPipeline:
                     conn.commit()
                     print(f"  Wrote final batch of {len(batch_rows)} records")
                 except Exception as e:
-                    print(f"  Error writing final batch: {e}")  
+                    print(f"  Error writing final batch: {e}", file=sys.stderr)
                     for record in batch_rows:
                         try:
                             cursor.execute(
@@ -419,7 +464,7 @@ class UnifiedHiCPipeline:
                                 record,
                             )
                         except Exception as e2:
-                            print(f"    Failed to write record {record[0]}: {e2}")
+                            print(f"    Failed to write record {record[0]}: {e2}", file=sys.stderr)
                     conn.commit()
 
         finally:
